@@ -992,8 +992,11 @@ class Ha(object):
                         'promoted self to leader by acquiring session lock'
                     )
             else:
-                return self.follow('demoted self after trying and failing to obtain lock',
-                                   'following new leader after trying and failing to obtain lock')
+                if self.dcs_offline_fallback():
+                    return self.follow('demoted self after trying and failing to obtain lock',
+                                       'following new leader after trying and failing to obtain lock')
+                else:
+                    return 'no other node is the leader and none have communicated with the DCS, continuing in degraded mode'
         else:
             # when we are doing manual failover there is no guaranty that new leader is ahead of any other node
             # node tagged as nofailover can be ahead of the new leader either, but it is always excluded from elections
@@ -1043,8 +1046,11 @@ class Ha(object):
                 if self.state_handler.is_leader():
                     if self.is_paused():
                         return 'continue to run as master after failing to update leader lock in DCS'
-                    self.demote('immediate-nolock')
-                    return 'demoted self because failed to update leader lock in DCS'
+                    if self.dcs_offline_fallback():
+                        self.demote('immediate-nolock')
+                        return 'demoted self because failed to update leader lock in DCS'
+                    else:
+                        return 'no other node is the leader and none have communicated with the DCS, continuing in degraded mode'
                 else:
                     return 'not promoting because failed to update leader lock in DCS'
         else:
@@ -1495,8 +1501,11 @@ class Ha(object):
             dcs_failed = True
             logger.error('Error communicating with DCS')
             if not self.is_paused() and self.state_handler.is_running() and self.state_handler.is_leader():
-                self.demote('offline')
-                return 'demoted self because DCS is not accessible and i was a leader'
+                if self.dcs_offline_fallback():
+                    self.demote('offline')
+                    return 'demoted self because DCS is not accessible and i was a leader'
+                else:
+                    return 'no other node is the leader and none have communicated with the DCS, continuing in degraded mode'
             return 'DCS is not accessible'
         except (psycopg.Error, PostgresConnectionException):
             return 'Error communicating with PostgreSQL. Will try again later'
@@ -1514,6 +1523,35 @@ class Ha(object):
             except Exception:
                 logger.exception('Unexpected exception')
                 return 'Unexpected exception raised, please report it as a BUG'
+
+    def dcs_offline_fallback(self):
+        # DCS failed, and we are the primary. We query all standbys and compare their dcs_last_seen timestamps
+        # with our own and the timestamp of the DCS outage (dcs_failed_timestamp). If the standbys experience
+        # the same DCS outage, we (the leader) continue as primary. If any of the standbys (i) is not reachable,
+        # (ii) has seen the DCS since or (iii) has been promoted to primary, we demote ourself to avoid
+        # split-brain.
+        logger.info('I am the leader, trying to reach members')
+        members = self.cluster.members
+        do_demote = False
+        if members:
+            for st in self.fetch_nodes_statuses(members):
+                logger.info('Looking at %s', st.member.name)
+                if not st.reachable:
+                    logger.error('Member %s is not reachable, assuming network partition', st.member.name)
+                    do_demote = True
+                    continue
+                if st.in_recovery:
+                    logger.debug('DCS was last seen by %s at %d', st.member.name, st.dcs_last_seen)
+                    if (st.dcs_last_seen > self.dcs.last_seen) and (st.dcs_last_seen > self._dcs_failed_timestamp):
+                        logger.error('Member %s has communicated with DCS since it started to fail for us, is healthier', st.member.name)
+                        do_demote = True
+                else:
+                    if st.member.name == self.state_handler.name:
+                        logger.debug('DCS was last seen by primary %s at %d', st.member.name, st.dcs_last_seen)
+                    else:
+                        logger.error('Node %s is also a primary', st.member.name)
+                        do_demote = True
+        return do_demote
 
     def shutdown(self):
         if self.is_paused():
