@@ -76,6 +76,7 @@ class Ha(object):
         self._async_response = CriticalTask()
         self._crash_recovery_executed = False
         self._crash_recovery_started = None
+        self._dcs_failed_timestamp = None
         self._start_timeout = None
         self._async_executor = AsyncExecutor(self.state_handler.cancellable, self.wakeup)
         self.watchdog = patroni.watchdog
@@ -1184,6 +1185,7 @@ class Ha(object):
                     self.demote('immediate')
                     return 'terminated crash recovery because of startup timeout'
 
+            self._dcs_failed_timestamp = None
             return 'updated leader lock during ' + self._async_executor.scheduled_action
         elif not self.state_handler.bootstrapping and not self.is_paused():
             # Don't have lock, make sure we are not promoting or starting up a master in the background
@@ -1337,6 +1339,10 @@ class Ha(object):
                 self.dcs.set_config_value(json.dumps(self.patroni.config.dynamic_configuration, separators=(',', ':')))
                 self.cluster = self.dcs.get_cluster()
 
+            # we reached the DCS at this point, so reset DCS failed timestamp
+            if self._dcs_failed_timestamp:
+                self._dcs_failed_timestamp = None
+
             if self._async_executor.busy:
                 return self.handle_long_action_in_progress()
 
@@ -1457,6 +1463,8 @@ class Ha(object):
                             ret = 'Copying logical slots {0} from the primary'.format(create_slots)
             return ret
         except DCSError:
+            if not self._dcs_failed_timestamp:
+                self._dcs_failed_timestamp = int(time.time())
             dcs_failed = True
             logger.error('Error communicating with DCS')
             if not self.is_paused() and self.state_handler.is_running() and self.state_handler.is_leader():
