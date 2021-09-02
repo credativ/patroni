@@ -1488,8 +1488,36 @@ class Ha(object):
             dcs_failed = True
             logger.error('Error communicating with DCS')
             if not self.is_paused() and self.state_handler.is_running() and self.state_handler.is_leader():
-                self.demote('offline')
-                return 'demoted self because DCS is not accessible and i was a leader'
+                # DCS failed, and we are the primary. We query all standbys and compare their dcs_last_seen timestamps
+                # with our own and the timestamp of the DCS outage (dcs_failed_timestamp). If the standbys experience
+                # the same DCS outage, we (the leader) continue as primary. If any of the standbys (i) is not reachable,
+                # (ii) has seen the DCS since or (iii) has been promoted to primary, we demote ourself to avoid
+                # split-brain.
+                logger.info('I am the leader, trying to reach members')
+                members = self.cluster.members
+                do_demote = 'false'
+                if members:
+                    for st in self.fetch_nodes_statuses(members):
+                        if not st.reachable:
+                            logger.error('Member %s is not reachable, assuming network partition', st.member.name)
+                            do_demote = 'true'
+                            continue
+                        if st.in_recovery:
+                            logger.debug('DCS was last seen by %s at %d', st.member.name, st.dcs_last_seen)
+                            if (st.dcs_last_seen > self.dcs.last_seen) and (st.dcs_last_seen > self._dcs_failed_timestamp):
+                                logger.error('Member %s has communicated with DCS since it started to fail for us, is healthier', st.member.name)
+                                do_demote = 'true'
+                        else:
+                            if st.member.name == self.state_handler.name:
+                                logger.debug('DCS was last seen by primary %s at %d', st.member.name, st.dcs_last_seen)
+                            else:
+                                logger.error('Node %s is also a primary', st.member.name)
+                                do_demote = 'true'
+                if do_demote == 'true':
+                    self.demote('offline')
+                    return 'demoted self because DCS is not accessible and i was a leader'
+                else:
+                    logger.warning('No other node is the leader and none have communicated with the DCS, continuing in degraded mode')
             return 'DCS is not accessible'
         except (psycopg2.Error, PostgresConnectionException):
             return 'Error communicating with PostgreSQL. Will try again later'
