@@ -7,6 +7,7 @@ from kazoo.client import KazooClient, KazooState, KazooRetry
 from kazoo.exceptions import NoNodeError, NodeExistsError, SessionExpiredError
 from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.protocol.states import KeeperState
+from kazoo.security import make_acl
 
 from . import AbstractDCS, ClusterConfig, Cluster, Failover, Leader, Member, SyncState, TimelineHistory
 from ..exceptions import DCSError
