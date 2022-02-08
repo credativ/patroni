@@ -65,6 +65,19 @@ class Rewind(object):
         except Exception:
             return logger.exception('Exception when working with leader')
 
+    @staticmethod
+    def check_leader_has_run_checkpoint(conn_kwargs):
+        try:
+            with get_connection_cursor(connect_timeout=3, options='-c statement_timeout=2000', **conn_kwargs) as cur:
+                cur.execute("SELECT NOT pg_catalog.pg_is_in_recovery()" +
+                            " AND ('x' || pg_catalog.substr(pg_catalog.pg_walfile_name(" +
+                            " pg_catalog.pg_current_wal_lsn()), 1, 8))::bit(32)::int = timeline_id" +
+                            " FROM pg_catalog.pg_control_checkpoint()")
+                if not cur.fetchone()[0]:
+                    return logger.info('Leader has not run a checkpoint yet and therefore can\'t be used for rewind')
+        except Exception:
+            return logger.exception('Exception when working with leader')
+
     def _get_checkpoint_end(self, timeline, lsn):
         """The checkpoint record size in WAL depends on postgres major version and platform (memory alignment).
         Hence, the only reliable way to figure out where it ends, read the record from file with the help of pg_waldump
@@ -337,10 +350,13 @@ class Rewind(object):
         #   running a checkpoint or
         #   waiting until Patroni on the master will expose checkpoint_after_promote=True
         checkpoint_status = leader.checkpoint_after_promote if isinstance(leader, Leader) else None
-        if checkpoint_status is None:  # master still runs the old Patroni
-            leader_status = self._postgresql.checkpoint(self._conn_kwargs(leader, self._postgresql.config.superuser))
-            if leader_status:
-                return logger.warning('Can not use %s for rewind: %s', leader.name, leader_status)
+        if checkpoint_status is None:  # we are the standby-cluster leader or master still runs the old Patroni
+            timeline_status = self.check_leader_has_run_checkpoint(r)
+            if timeline_status:  # we checked the leader's timeline in pg_control, and it is outdated
+                leader_status = self._postgresql.checkpoint(
+                        self._conn_kwargs(leader, self._postgresql.config.superuser))
+                if leader_status:  # we tried to run a checkpoint on the remote leader, but it failed
+                    return logger.warning('Can not use %s for rewind: %s', leader.name, leader_status)
         elif not checkpoint_status:
             return logger.info('Waiting for checkpoint on %s before rewind', leader.name)
         elif not self.check_leader_is_not_in_recovery(r):
